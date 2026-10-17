@@ -111,12 +111,18 @@ def extract_csv(data: bytes, name: str) -> ExtractedDocument:
     rows = [r for r in rows if any(c.strip() for c in r)]
     if len(rows) < 2:
         raise ExtractionError(f"'{name}' needs a header row and at least one data row.")
-    header, body = rows[0], rows[1:MAX_CSV_ROWS + 1]
+    header, body = [h.strip() for h in rows[0]], rows[1:MAX_CSV_ROWS + 1]
+    if not all(header) or len(set(header)) != len(header) or any(h.startswith("_") for h in header):
+        raise ExtractionError("CSV headers must be unique, non-empty, and must not start with an underscore.")
+    if any(len(row) != len(header) for row in body):
+        raise ExtractionError("CSV rows must have the same number of cells as the header.")
     sections = [(f"row {i}", "; ".join(f"{h.strip()}: {v.strip()}" for h, v in zip(header, row) if v.strip()))
                 for i, row in enumerate(body, start=2)]
     warnings = [f"Only the first {MAX_CSV_ROWS} rows were read."] if len(rows) - 1 > MAX_CSV_ROWS else []
     return ExtractedDocument(title=f"Dataset: {Path(name).stem}", sections=sections, kind="csv",
-                             metadata={"columns": header, "rows": len(body)}, warnings=warnings)
+                             metadata={"columns": header, "rows": len(body), "records": [
+                                 {**dict(zip(header, row)), "_location": loc, "_quote": quote}
+                                 for row, (loc, quote) in zip(body, sections)]}, warnings=warnings)
 
 
 def extract_upload(name: str, data: bytes, max_bytes: int) -> ExtractedDocument:
@@ -149,7 +155,7 @@ def extract_html(html: str, url: str) -> str | None:
     """Main-content extraction from an HTML page with trafilatura. Returns None if nothing usable is found."""
     import trafilatura
 
-    text = trafilatura.extract(html, url=url, include_comments=False, include_tables=False, favor_precision=True)
+    text = trafilatura.extract(html, url=url, include_comments=False, include_tables=True, favor_precision=True)
     return text[:MAX_CHARS] if text and len(text) > 200 else None
 
 

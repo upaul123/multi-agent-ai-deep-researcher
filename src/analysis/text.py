@@ -97,13 +97,6 @@ def polarity(text: str) -> int:
     return -1 if NEGATIVE_CUES.search(text) else 1
 
 
-def numbers_with_units(text: str) -> list[tuple[float, str]]:
-    found = []
-    for value, unit in re.findall(r"(\d+(?:\.\d+)?)\s?(%|percent|per cent)", text, re.I):
-        found.append((float(value), "%"))
-    return found
-
-
 CHANGE_WORDS = re.compile(r"\b(grow|grew|growth|increase\w*|decrease\w*|reduc\w*|cut|rise|rose|fall|fell|decline\w*|"
                           r"improv\w*|by)\s*$", re.I)
 

@@ -1,7 +1,9 @@
 """Typed LangGraph state shared by all agents.
 
 Append-only channels (events, search log, warnings, errors) use an `add` reducer, so every node's
-contributions are kept as an audit trail. All other channels are replaced by the node that owns them.
+contributions are kept as an audit trail. `statuses` merges per agent, because the Insight Generator and the Data
+Visualizer run in parallel and each reports only its own status. All other channels are replaced by the node that
+owns them.
 """
 from __future__ import annotations
 
@@ -12,7 +14,13 @@ from pydantic import BaseModel, Field
 
 from src.models.evidence import (AgentEvent, AgentStatus, Claim, Contradiction, EvidenceLink, Insight, MatrixRow,
                                  Passage, Report, ResearchGap, Source, SourceAssessment)
+from src.models.visualization import EvidenceChart
 from src.models.research import BudgetUsage, ResearchBudget, ResearchPlan, ResearchRequest, now
+
+
+def merge_statuses(current: dict | None, update: dict | None) -> dict:
+    """Reducer: each node reports only its own agent's status, so parallel nodes never overwrite each other."""
+    return {**(current or {}), **(update or {})}
 
 
 class QueryTask(BaseModel):
@@ -52,8 +60,10 @@ class ResearchState(TypedDict, total=False):
     contradictions: list[Contradiction]
     gaps: list[ResearchGap]
     insights: list[Insight]
+    charts: list[EvidenceChart]
+    visualization_notes: list[str]
     report: Report | None
-    statuses: dict[str, AgentStatus]
+    statuses: Annotated[dict[str, AgentStatus], merge_statuses]
     usage: BudgetUsage
     route: str  # follow_up | synthesize
     route_reason: str
@@ -67,4 +77,4 @@ class ResearchState(TypedDict, total=False):
 
 
 AGENT_ORDER = ["planner", "retriever", "source_evaluator", "critical_analyst", "gap_analyst", "insight_generator",
-               "report_builder"]
+               "data_visualizer", "report_builder"]

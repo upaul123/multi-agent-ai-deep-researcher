@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import hashlib
+from src.services.observability import map_with_context, submit_with_context, operation
 from concurrent.futures import ThreadPoolExecutor
 
 from src.agents.base import Agent, RunContext
@@ -54,6 +55,7 @@ class RetrieverAgent(Agent):
             chosen.append(by_name["upload"])
         return chosen[:3]
 
+    @operation("search.provider")
     def _search_one(self, provider, task: QueryTask, state: ResearchState, ctx: RunContext,
                     max_results: int) -> tuple[QueryTask, object, list[SearchResult], Origin | None, SearchRecord]:
         request = state["request"]
@@ -101,7 +103,7 @@ class RetrieverAgent(Agent):
         records: list[SearchRecord] = []
         new_count = 0
         with ThreadPoolExecutor(max_workers=ctx.max_parallel) as pool:
-            futures = [pool.submit(self._search_one, provider, task, state, ctx, max_results) for provider, task in jobs]
+            futures = [submit_with_context(pool, self._search_one, provider, task, state, ctx, max_results) for provider, task in jobs]
             for future in futures:  # consume in submission order: deterministic source order
                 task, provider, results, origin, record = future.result()
                 added = 0
@@ -194,7 +196,7 @@ class RetrieverAgent(Agent):
 
         count = 0
         with ThreadPoolExecutor(max_workers=ctx.max_parallel) as pool:
-            for source_id, text in pool.map(fetch, targets):
+            for source_id, text in map_with_context(pool, fetch, targets):
                 if text:
                     store.replace_content(source_id, text)
                     count += 1

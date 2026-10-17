@@ -6,6 +6,8 @@ gaps, and labels any use of general knowledge separately from the research corpu
 """
 from __future__ import annotations
 
+import logging
+
 from pydantic import BaseModel, Field
 
 from src.analysis.text import truncate
@@ -16,6 +18,7 @@ from src.orchestration.budget import RunBudget
 from src.retrieval.bm25 import BM25Index
 from src.services.llm import LLMClient, wrap_untrusted
 
+logger = logging.getLogger(__name__)
 AGREEMENT_TEXT = {"strong": "strong agreement", "moderate": "moderate agreement", "single_source": "single source",
                   "mixed": "mixed evidence", "contested": "contested"}
 
@@ -60,11 +63,12 @@ class _Numbering:
         return f"[{n}]"
 
 
-def answer_question(bundle: RunBundle, question: str, llm: LLMClient | None = None, use_llm: bool = False) -> QAAnswer:
+def answer_question(bundle: RunBundle, question: str, llm: LLMClient | None = None, use_llm: bool = False,
+                    vectors=None) -> QAAnswer:
     question = question.strip()[:500]
     numbering = _Numbering(bundle)
     rows = BM25Index(bundle.matrix, lambda r: r.claim + " " + " ".join(r.weaknesses)).search(question, k=4)
-    passages = BM25Index(bundle.passages, lambda p: p.text).search(question, k=6)
+    passages, semantic = _search_passages(bundle, question, vectors)
     claims_by_id = {c.id: c for c in bundle.claims}
 
     if not rows and not passages:
@@ -86,7 +90,8 @@ def answer_question(bundle: RunBundle, question: str, llm: LLMClient | None = No
     gaps = [g.description for g in bundle.gaps if g.subquestion_id in sq_ids][:3]
 
     deterministic = _compose(bundle, rows, passages, numbering, claims_by_id)
-    how = (f"Matched {len(rows)} evidence-matrix row(s) and {len(passages)} source passage(s) by keyword relevance. "
+    how = (f"Matched {len(rows)} evidence-matrix row(s) and {len(passages)} source passage(s) by "
+           f"{'semantic similarity (Pinecone)' if semantic else 'keyword relevance'}. "
            "Agreement levels count independent sources only; copies of the same original count once.")
     answer = QAAnswer(question=question, answer=deterministic, basis="research corpus", conflicts=conflicts[:4],
                       gaps=gaps, how_reached=how)
@@ -107,6 +112,19 @@ def answer_question(bundle: RunBundle, question: str, llm: LLMClient | None = No
     if bundle.summary.mode == "demo":
         answer.answer += "\n\n_All sources in this investigation are synthetic demo data._"
     return answer
+
+
+def _search_passages(bundle: RunBundle, question: str, vectors) -> tuple[list, bool]:
+    """Best passages for a question, and whether they came from Pinecone (False: keyword search, or fallback)."""
+    if vectors is not None and bundle.passages:
+        try:
+            vectors.ensure_indexed((p.id, p.text, {"kind": "passage", "source_id": p.source_id}) for p in bundle.passages)
+            by_id = {p.id: p for p in bundle.passages}
+            hits = [(by_id[pid], score) for pid, score in vectors.search(question, k=6, kind="passage") if pid in by_id]
+            return hits, True
+        except Exception:
+            logger.warning("Semantic search failed for Q&A; using keyword search.", exc_info=True)
+    return BM25Index(bundle.passages, lambda p: p.text).search(question, k=6), False
 
 
 def _compose(bundle: RunBundle, rows, passages, numbering: _Numbering, claims_by_id) -> str:
@@ -145,7 +163,8 @@ def _llm_answer(bundle: RunBundle, question: str, rows, passages, llm: LLMClient
     for r, _ in rows:
         for sid in r.supporting_source_ids[:3]:
             allowed.setdefault(sid, next((p for p in bundle.passages if p.source_id == sid), None))
-    prompt = (f"Follow-up question about a completed investigation: {question}\n\nEvidence-matrix rows:\n{row_text}\n\n"
+    prompt = ("Follow-up question about a completed investigation:\n" + wrap_untrusted("user_question", question)
+              + "\n\nEvidence-matrix rows:\n" + wrap_untrusted("evidence_matrix", row_text) + "\n\n"
               "Source passages:\n" + "\n".join(blocks) +
               "\n\nAnswer using the evidence above. Cite sources inline by writing their id in square brackets, e.g. "
               "[src_abc123]. Point out conflicting evidence and missing evidence. If you add anything from general "

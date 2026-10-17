@@ -15,6 +15,7 @@ from src.analysis.text import (CLAIM_CUES, FORECAST_CUES, INJECTION_PATTERNS, OP
 from src.models.evidence import Claim, ClaimType, Passage, Source
 from src.models.research import ResearchPlan
 from src.retrieval.bm25 import BM25Index
+from src.analysis.claim_validation import paraphrase_issues
 
 MAX_CLAIMS_PER_SOURCE = 6
 
@@ -108,7 +109,7 @@ class ClaimDraftList(BaseModel):
 
 def validate_llm_claims(drafts: ClaimDraftList, source: Source, passages: list[Passage],
                         matcher: SubquestionMatcher) -> tuple[list[Claim], int]:
-    """Keep only drafts whose quote appears verbatim in a passage. Returns (claims, rejected_count)."""
+    """Validate quoted evidence and paraphrase integrity, preserving original source wording."""
     accepted, rejected = [], 0
     for draft in drafts.claims:
         quote = draft.quote.strip().strip('"“”')
@@ -116,13 +117,19 @@ def validate_llm_claims(drafts: ClaimDraftList, source: Source, passages: list[P
         if passage is None or INJECTION_PATTERNS.search(quote):
             rejected += 1
             continue
-        try:
-            ctype = ClaimType(draft.claim_type.lower())
-        except ValueError:
-            ctype = classify_claim(quote)
+        if paraphrase_issues(quote, draft.claim.strip() or quote):
+            rejected += 1
+            continue
+        # Keep the original source spelling and whitespace, rather than model-normalized wording.
+        match = re.search(r"\s+".join(re.escape(word) for word in quote.split()), passage.text, re.I)
+        if match is None:
+            rejected += 1
+            continue
+        quote = match.group(0)
+        ctype = classify_claim(quote)
         accepted.append(Claim(
-            id=claim_id(source.id, quote), text=draft.claim.strip()[:400] or quote, quote=quote, claim_type=ctype,
-            polarity=-1 if draft.sceptical else polarity(quote), source_id=source.id, passage_id=passage.id,
+            id=claim_id(source.id, quote), text=quote, quote=quote, claim_type=ctype,
+            polarity=polarity(quote), source_id=source.id, passage_id=passage.id,
             location=passage.location, subquestion_id=matcher.best(quote + " " + draft.claim, source.subquestion_ids),
-            extracted_by="llm"))
+            extracted_by="llm", notes=["Canonical source wording retained; paraphrase integrity checks passed."]))
     return accepted[:MAX_CLAIMS_PER_SOURCE + 2], rejected

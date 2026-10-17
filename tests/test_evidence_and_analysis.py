@@ -57,7 +57,7 @@ def test_text_markdown_and_csv_extraction():
 @pytest.mark.parametrize("name,data,message", [
     ("evil.exe", b"MZ", "unsupported type"), ("empty.txt", b"", "is empty"), ("fake.pdf", b"hello", "not a valid PDF"),
     ("big.txt", b"x" * (MAX + 1), "exceeds"), ("one.csv", b"header_only\n", "header row and at least one"),
-])
+], ids=["exe", "empty", "fake-pdf", "too-big", "header-only"])  # short ids: Windows caps PYTEST_CURRENT_TEST length
 def test_upload_errors(name, data, message):
     with pytest.raises(ExtractionError, match=message):
         extract_upload(name, data, MAX)

@@ -1,4 +1,4 @@
-"""Evidence store: normalisation, deduplication, chunking and passage ranking for a research run.
+"""Evidence store: normalisation, deduplication, chunking and passage storage for a research run.
 
 Deduplication rules:
 - Same canonical URL, DOI/document id, or content hash -> the same source (merged, not re-added).
@@ -16,7 +16,6 @@ from src.analysis.text import INJECTION_PATTERNS, jaccard, near_duplicate, token
 from src.ingestion.chunking import chunk_sections
 from src.ingestion.extract import find_references
 from src.models.evidence import Origin, Passage, Source, SourceType, content_hash, stable_source_id
-from src.retrieval.bm25 import BM25Index
 from src.search.base import SearchResult
 
 TRACKING_PARAMS = re.compile(r"^(utm_|fbclid|gclid|mc_|ref$|ref_src|igshid)")
@@ -137,14 +136,9 @@ class EvidenceStore:
             source.limitations.append("Contains instruction-like text aimed at AI systems; treated strictly as data.")
         self.passages[source_id] = chunk_sections(source_id, [("full text", full_text)])
 
-    # ------------------------------------------------------------------ ranking
+    # ------------------------------------------------------------------ passages and independence
     def all_passages(self) -> list[Passage]:
         return [p for ps in self.passages.values() for p in ps]
-
-    def rank_passages(self, query: str, source_ids: set[str] | None = None, k: int = 8) -> list[Passage]:
-        candidates = [p for p in self.all_passages() if source_ids is None or p.source_id in source_ids]
-        ranked = BM25Index(candidates, lambda p: p.text).search(query, k=k)
-        return [p.model_copy(update={"score": score}) for p, score in ranked]
 
     def independent_groups(self, source_ids: list[str]) -> list[set[str]]:
         """Group sources that repeat the same original (related_ids), so corroboration isn't double counted."""

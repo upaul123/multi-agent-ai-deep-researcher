@@ -84,6 +84,11 @@ def validate_citations(text: str, references: list[dict], sources: dict[str, Sou
     return checks
 
 
+def strip_citations(text: str) -> str:
+    """Drop numeric citation markers like [1] or [2, 3] from text shown to readers without numbered references."""
+    return re.sub(r"[ \t]*\[\d+(?:\s*,\s*\d+)*\]", "", text)
+
+
 def strip_invalid_markers(text: str, valid_numbers: set[int]) -> tuple[str, int]:
     removed = 0
 

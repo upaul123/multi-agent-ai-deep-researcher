@@ -3,9 +3,15 @@
     START → planner → retriever → source_evaluator → critical_analyst → gap_analyst
                                         ↑                                   │
                                         └──── follow_up_retrieval ◄── "follow_up"
-                                                                            │ "synthesize"
-                                                                            ▼
-                                             insight_generator → report_builder → END
+                                                                            │ "synthesize" (fan-out)
+                                                              ┌─────────────┴─────────────┐
+                                                      insight_generator           data_visualizer
+                                                              └─────────────┬─────────────┘
+                                                                     report_builder → END (fan-in: waits for both)
+
+The Insight Generator and the Data Visualizer are independent (neither reads the other's output), so they run in
+the same LangGraph step, in parallel. Within nodes, searches, page fetches and per-source claim extraction also run
+concurrently (see the retriever and the critical analyst).
 
 The loop is bounded by `ResearchBudget.max_iterations` plus search/source/time budgets, all enforced in
 deterministic code (`gap_analyst.decide_route` and `RunBudget`). Each node is wrapped so that failures are
@@ -21,6 +27,7 @@ from langgraph.graph import END, START, StateGraph
 
 from src.agents.base import Agent, RunContext
 from src.agents.critical_analyst import CriticalAnalystAgent
+from src.agents.data_visualizer import DataVisualizationAgent
 from src.agents.gap_analyst import GapAnalystAgent
 from src.agents.insight_generator import InsightGeneratorAgent
 from src.agents.planner import PlannerAgent
@@ -34,14 +41,15 @@ logger = logging.getLogger(__name__)
 
 AGENTS: dict[str, Agent] = {a.name: a for a in (PlannerAgent(), RetrieverAgent(), SourceEvaluatorAgent(),
                                                 CriticalAnalystAgent(), GapAnalystAgent(), InsightGeneratorAgent(),
-                                                ReportBuilderAgent())}
+                                                DataVisualizationAgent(), ReportBuilderAgent())}
 NODE_AGENT = {"planner": "planner", "retriever": "retriever", "follow_up_retrieval": "retriever",
               "source_evaluator": "source_evaluator", "critical_analyst": "critical_analyst",
-              "gap_analyst": "gap_analyst", "insight_generator": "insight_generator", "report_builder": "report_builder"}
+              "gap_analyst": "gap_analyst", "insight_generator": "insight_generator",
+              "data_visualizer": "data_visualizer", "report_builder": "report_builder"}
 NODE_LABELS = {"planner": "Research Planner", "retriever": "Contextual Retriever",
                "follow_up_retrieval": "Contextual Retriever (follow-up)", "source_evaluator": "Source Evaluation",
                "critical_analyst": "Critical Analysis", "gap_analyst": "Research Gap & Follow-up",
-               "insight_generator": "Insight Generation", "report_builder": "Report Builder"}
+               "insight_generator": "Insight Generation", "data_visualizer": "Data Visualization", "report_builder": "Report Builder"}
 
 
 class EventLog:
@@ -69,8 +77,7 @@ def _node(node_name: str, ctx: RunContext, log: EventLog):
 
     def run(state: ResearchState) -> dict:
         iteration = state.get("iteration", 0)
-        statuses = dict(state.get("statuses", {}))
-        status = statuses.get(agent.name, AgentStatus(agent=agent.name)).model_copy()
+        status = state.get("statuses", {}).get(agent.name, AgentStatus(agent=agent.name)).model_copy()
         ctx.event(agent.name, "started", f"{NODE_LABELS[node_name]} started.", iteration)
         started = time.perf_counter()
         try:
@@ -88,18 +95,25 @@ def _node(node_name: str, ctx: RunContext, log: EventLog):
                           "stop_reason": "Gap analysis failed."}
         status.runs += 1
         status.duration_ms += int((time.perf_counter() - started) * 1000)
-        statuses[agent.name] = status
-        update["statuses"] = statuses
+        update["statuses"] = {agent.name: status}  # merged by the reducer; parallel nodes never clash
         update["errors"] = errors + update.get("errors", [])
         update["events"] = log.drain()
         return update
     return run
 
 
+SYNTHESIS_BRANCHES = ["insight_generator", "data_visualizer"]
+
+
 def route_after_gaps(state: ResearchState) -> str:
     if state.get("plan") is None:
         return "synthesize"
     return "follow_up" if state.get("route") == "follow_up" else "synthesize"
+
+
+def next_after_gaps(state: ResearchState) -> list[str]:
+    """Follow-up retrieval, or both synthesis branches at once (a parallel fan-out)."""
+    return ["follow_up_retrieval"] if route_after_gaps(state) == "follow_up" else SYNTHESIS_BRANCHES
 
 
 def route_after_planner(state: ResearchState) -> str:
@@ -116,19 +130,8 @@ def build_graph(ctx: RunContext):
     graph.add_edge("retriever", "source_evaluator")
     graph.add_edge("source_evaluator", "critical_analyst")
     graph.add_edge("critical_analyst", "gap_analyst")
-    graph.add_conditional_edges("gap_analyst", route_after_gaps,
-                                {"follow_up": "follow_up_retrieval", "synthesize": "insight_generator"})
+    graph.add_conditional_edges("gap_analyst", next_after_gaps, ["follow_up_retrieval", *SYNTHESIS_BRANCHES])
     graph.add_edge("follow_up_retrieval", "source_evaluator")
-    graph.add_edge("insight_generator", "report_builder")
+    graph.add_edge(SYNTHESIS_BRANCHES, "report_builder")  # fan-in: the report waits for both branches
     graph.add_edge("report_builder", END)
     return graph.compile()
-
-
-def graph_mermaid() -> str:
-    from src.config import get_settings
-    from src.orchestration.budget import RunBudget
-    from src.models.research import ResearchBudget
-    from src.search.registry import ProviderSet
-
-    ctx = RunContext(settings=get_settings(), budget=RunBudget(ResearchBudget()), providers=ProviderSet())
-    return build_graph(ctx).get_graph().draw_mermaid()

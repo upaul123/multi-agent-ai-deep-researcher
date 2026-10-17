@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from src.config import Settings
 from src.models.research import ResearchMode
+from src.retrieval.vector import open_run_vectors
 from src.search.http import HttpClient
 from src.search.local import DemoProvider, UploadedDocumentProvider
 from src.search.providers import ArxivProvider, CrossrefProvider, OpenAlexProvider, TavilyProvider
@@ -27,6 +29,7 @@ class ProviderSet:
     notes: list[str] = field(default_factory=list)  # capability explanations shown to the user
     http: HttpClient | None = None
     crossref: CrossrefProvider | None = None  # for resolving DOI leads
+    vectors: Any = None  # RunVectors when Pinecone semantic search is on for this run; None means keyword search
 
     @property
     def live(self) -> bool:
@@ -34,7 +37,7 @@ class ProviderSet:
 
 
 def build_providers(settings: Settings, mode: ResearchMode, preferences: set[str], uploaded: list[dict],
-                    choices: ProviderSettings | None = None) -> ProviderSet:
+                    choices: ProviderSettings | None = None, run_id: str | None = None) -> ProviderSet:
     choices = choices or ProviderSettings()
     result = ProviderSet()
     if mode == ResearchMode.DEMO:
@@ -67,7 +70,8 @@ def build_providers(settings: Settings, mode: ResearchMode, preferences: set[str
         if not result.providers and not uploaded:
             result.notes.append("No live source is enabled for the selected source types. Enable academic sources, "
                                 "configure TAVILY_API_KEY, or upload documents.")
+    result.vectors = open_run_vectors(settings, mode, run_id, result.notes)
     if uploaded:  # documents the user explicitly attached to this run
-        result.providers.append(UploadedDocumentProvider(uploaded))
+        result.providers.append(UploadedDocumentProvider(uploaded, result.vectors))
         result.notes.append(f"Including {len(uploaded)} uploaded document(s).")
     return result

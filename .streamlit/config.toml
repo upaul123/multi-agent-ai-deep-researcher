@@ -1,67 +1,76 @@
-# Theme inspired by the Composio docs look: near-white / near-black surfaces, hairline borders,
-# square corners, a deep-blue accent, a neo-grotesk sans and JetBrains Mono for labels.
-# ABC Diatype (Composio's font) is commercially licensed, so Geist (OFL) is used as the sans-serif.
+# Deep Research Agent theme: high-contrast dark and light modes. Both variants are defined, so the app follows the
+# device setting and users can switch in the app menu (⋮ → Settings → Theme). The frosted-glass layer in
+# src/ui/components.py adapts to the active mode with CSS light-dark(), using the same palette as below.
+# Palette: deep navy ground, cyan accent, soft violet second accent. Sora headings, DM Sans body, JetBrains Mono code.
 
 [theme]
-font = "Geist:https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&display=swap, sans-serif"
-headingFont = "Geist:https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&display=swap, sans-serif"
-codeFont = "JetBrains Mono:https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap, monospace"
+font = "'DM Sans':https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap, sans-serif"
+headingFont = "Sora:https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700&display=swap, sans-serif"
+codeFont = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap, monospace"
 baseFontSize = 15
-headingFontWeights = [500, 500, 500, 500, 500, 500]
-headingFontSizes = ["2.4rem", "1.55rem", "1.2rem", "1.05rem", "1rem", "0.95rem"]
-metricValueFontWeight = 500
-baseRadius = "none"
-buttonRadius = "none"
+headingFontWeights = [700, 600, 600, 600, 600, 600]
+headingFontSizes = ["2.2rem", "1.45rem", "1.15rem", "1.02rem", "0.95rem", "0.9rem"]
+metricValueFontWeight = 700
+baseRadius = "0.85rem"
+buttonRadius = "12px"
 showWidgetBorder = true
 showSidebarBorder = true
 linkUnderline = false
 
 [theme.light]
-primaryColor = "#0007cd"
-backgroundColor = "#fbfbfb"
-secondaryBackgroundColor = "#f3f3f3"
-textColor = "#0f0f0f"
-borderColor = "#e5e5e5"
-dataframeBorderColor = "#e5e5e5"
-dataframeHeaderBackgroundColor = "#f3f3f3"
-linkColor = "#0007cd"
-codeBackgroundColor = "#f3f3f3"
-blueColor = "#0007cd"
-greenColor = "#009588"
-orangeColor = "#f05100"
-yellowColor = "#fcbb00"
-redColor = "#dc2626"
-chartCategoricalColors = ["#0007cd", "#009588", "#f05100", "#fcbb00", "#104e64", "#f99c00", "#585858"]
+primaryColor = "#0A7EA4"
+backgroundColor = "#F2F6FB"
+secondaryBackgroundColor = "#E6EDF6"
+textColor = "#0B1220"
+borderColor = "#D3DCE8"
+linkColor = "#086A8A"
+codeBackgroundColor = "#E6EDF6"
+dataframeBorderColor = "#D9E1EC"
+dataframeHeaderBackgroundColor = "#E9EFF7"
+blueColor = "#1D6FB8"
+greenColor = "#047857"
+orangeColor = "#B45309"
+yellowColor = "#A16207"
+redColor = "#B91C1C"
+violetColor = "#5A49D6"
+grayColor = "#4A5470"
+chartCategoricalColors = ["#0A7EA4", "#5A49D6", "#047857", "#B45309", "#BE185D", "#0F766E", "#4A5470"]
 
 [theme.light.sidebar]
-backgroundColor = "#fbfbfb"
-secondaryBackgroundColor = "#f3f3f3"
-borderColor = "#e5e5e5"
+backgroundColor = "#F8FAFD"
+secondaryBackgroundColor = "#EAF0F8"
+borderColor = "#DCE4EE"
 
 [theme.dark]
-primaryColor = "#5b8bf0"
-backgroundColor = "#0f0f0f"
-secondaryBackgroundColor = "#1c1c1c"
-textColor = "#fbfbfb"
-borderColor = "#262626"
-dataframeBorderColor = "#262626"
-dataframeHeaderBackgroundColor = "#1a1a1a"
-linkColor = "#5b8bf0"
-codeBackgroundColor = "#1a1a1a"
-blueColor = "#5b8bf0"
-greenColor = "#00bb7f"
-orangeColor = "#f99c00"
-yellowColor = "#fcbb00"
-redColor = "#ef4444"
-chartCategoricalColors = ["#5b8bf0", "#00bb7f", "#f99c00", "#ac4bff", "#ff2357", "#1447e6", "#b4b4b4"]
+primaryColor = "#3BDCFF"
+backgroundColor = "#070B18"
+secondaryBackgroundColor = "#111A30"
+textColor = "#EEF2FF"
+borderColor = "#26324F"
+linkColor = "#7BE8FF"
+codeBackgroundColor = "#0E1629"
+dataframeBorderColor = "#22304D"
+dataframeHeaderBackgroundColor = "#111A30"
+blueColor = "#60A5FA"
+greenColor = "#34D399"
+orangeColor = "#FBBF24"
+yellowColor = "#FDE047"
+redColor = "#F87171"
+violetColor = "#9A8CFF"
+grayColor = "#AAB4D0"
+chartCategoricalColors = ["#3BDCFF", "#9A8CFF", "#34D399", "#FBBF24", "#F472B6", "#2DD4BF", "#AAB4D0"]
 
 [theme.dark.sidebar]
-backgroundColor = "#0f0f0f"
-secondaryBackgroundColor = "#1a1a1a"
-borderColor = "#262626"
+backgroundColor = "#0A1022"
+secondaryBackgroundColor = "#131D36"
+borderColor = "#1E2945"
 
 [server]
 maxUploadSize = 15
+enableStaticServing = true  # serves ./static (logo, hero image) at app/static/ for the glass hero layouts
+
+[client]
+toolbarMode = "viewer"  # keeps the menu's Settings (theme switch) and hides developer options such as "Deploy"
 
 [browser]
 gatherUsageStats = false
