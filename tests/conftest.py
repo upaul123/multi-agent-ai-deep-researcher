@@ -29,7 +29,8 @@ def no_network(monkeypatch):
 
 @pytest.fixture
 def settings(tmp_path):
-    return replace(get_settings(), openrouter_api_key=None, tavily_api_key=None, db_path=tmp_path / "test.db")
+    return replace(get_settings(), openrouter_api_key=None, tavily_api_key=None, pinecone_api_key=None,
+                   db_path=tmp_path / "test.db")
 
 
 @pytest.fixture

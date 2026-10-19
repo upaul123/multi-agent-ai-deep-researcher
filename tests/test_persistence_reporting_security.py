@@ -1,4 +1,6 @@
 """Persistence & history, report rendering/export, Q&A, prompt-injection resistance."""
+import re
+
 import pytest
 
 from src.agents.qa import answer_question
@@ -56,7 +58,7 @@ def test_history_survives_restart(settings, tmp_path, demo_request):
 
 def test_stale_runs_documents_cache_and_settings(repo, demo_request):
     repo.create_run("run_stale", demo_request)
-    repo.mark_stale_runs()
+    assert repo.reap_stale_runs(stale_after_seconds=-1) == ["run_stale"]  # cutoff in the future: any heartbeat is stale
     assert repo.list_runs()[0].status == "failed"
     doc_id, created = repo.save_document("a.txt", "A", "text", b"data", [("paragraph 1", "data")], [])
     again, created_again = repo.save_document("copy.txt", "A", "text", b"data", [("paragraph 1", "data")], [])
@@ -77,8 +79,16 @@ def test_report_structure_and_citations(stored_run):
     _, bundle = stored_run
     report = bundle.report
     keys = [s.key for s in report.sections]
-    assert keys == ["scope", "executive_summary", "key_findings", "detailed_analysis", "evidence", "trends",
-                    "implications", "risks", "next_steps", "limitations", "references"]
+    # Summary first, then Introduction → Analysis → Findings → Recommendations → Conclusion, then supporting material
+    assert keys == ["executive_summary", "introduction", "detailed_analysis", "evidence", "key_findings", "next_steps",
+                    "conclusion", "limitations", "visualizations", "references"]
+    assert [s.title for s in report.sections][:7] == ["Executive summary", "Introduction", "Analysis",
+                                                       "Evidence overview", "Findings", "Recommendations", "Conclusion"]
+    assert report.section("executive_summary").content.startswith("**Objective:**")
+    assert "| Item | Detail |" in report.section("introduction").content  # scope at a glance as a table
+    assert "### Risks and alternative interpretations" in report.section("key_findings").content
+    assert report.section("next_steps").content.startswith("1. **")  # numbered, actionable recommendations
+    assert "evidence gathered is" in report.section("conclusion").content
     assert report.references and all(r["synthetic"] for r in report.references)
     assert report.citation_checks and all(c.valid for c in report.citation_checks)
     assert "synthetic demo data" in report.section("limitations").content
@@ -90,7 +100,9 @@ def test_report_structure_and_citations(stored_run):
 def test_report_exports(stored_run):
     _, bundle = stored_run
     md = to_markdown(bundle.report, demo=True)
-    assert md.startswith("# Research report") and "SYNTHETIC DEMO REPORT" in md and "## References" in md
+    assert md.startswith("# Research report") and "SYNTHETIC DEMO REPORT" in md and "## Sources consulted" in md
+    assert not re.search(r"\[\d+\]", md) and "Citation traceability" not in md
+    assert "| Claim | Agreement | Quality |" in md
     html = to_html(bundle.report, demo=True)
     assert html.startswith("<!doctype html>") and "<h2>Executive summary</h2>" in html
     pdf = to_pdf(bundle.report, demo=True)
@@ -154,10 +166,9 @@ def test_prompt_injection_in_sources_is_contained(stored_run):
     assert any("instruction-like" in l for l in source.limitations)
 
 
-def test_injection_source_flagged_in_payments_question(settings, repo):
-    from src.models.research import ResearchRequest
-    state = run_research(ResearchRequest(question="How are major payment companies adopting generative AI for fraud?"),
-                         settings, repo=repo, today=TODAY)
+def test_injection_source_flagged_in_demo_question(settings, repo):
+    from src.models.research import DEMO_QUESTIONS, ResearchRequest
+    state = run_research(ResearchRequest(question=DEMO_QUESTIONS[1]), settings, repo=repo, today=TODAY)
     injected = [s for s in state["sources"] if "Ignore all previous" in s.content]
     assert injected
     assert "prompt_injection_attempt" in state["assessments"][injected[0].id].flags
@@ -187,3 +198,11 @@ def test_demo_mode_never_uses_network(settings, demo_request):
     assert demo_request.mode == ResearchMode.DEMO
     state = run_research(demo_request, settings, today=TODAY)
     assert state["report"] is not None and all(r.provider == "demo" or r.provider == "lead" for r in state["search_log"])
+
+
+def test_html_export_keeps_banners_and_lists(stored_run):
+    from src.reporting.render import to_html
+    _, bundle = stored_run
+    page = to_html(bundle.report, demo=True)
+    assert '<blockquote class="banner">' in page and "&gt; " not in page  # banners render as quotes, not "> text"
+    assert "<li>Separate well-supported findings" in page  # lists after bold labels are real lists

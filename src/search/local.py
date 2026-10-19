@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date
 from functools import lru_cache
 from pathlib import Path
@@ -11,6 +12,7 @@ from src.retrieval.bm25 import BM25Index
 from src.search.base import SearchResult, parse_date
 
 DEMO_LIMITATION = "SYNTHETIC demo source: fictional content for demonstration only. Not real evidence."
+logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=4)
@@ -57,16 +59,29 @@ class UploadedDocumentProvider:
     available = True
     unavailable_reason = ""
 
-    def __init__(self, documents: list[dict]):
+    def __init__(self, documents: list[dict], vectors=None):
         # documents: [{"id", "title", "kind", "sections": [(location, text)], "filename"}]
         self.documents = documents
         self.sections = [(doc, loc, text) for doc in documents for loc, text in doc["sections"]]
         self.index = BM25Index(self.sections, lambda s: f"{s[0]['title']} {s[2]}")
+        self.vectors = vectors  # RunVectors when semantic search is on; keyword search is the fallback
+        self._section_keys = {f"upload:{n}": section for n, section in enumerate(self.sections)}
+
+    def _ranked_sections(self, query: str) -> list[tuple[tuple, float]]:
+        if self.vectors is not None:
+            try:
+                self.vectors.ensure_indexed((key, section[2], {"kind": "section"})
+                                            for key, section in self._section_keys.items())
+                hits = self.vectors.search(query, k=40, kind="section")
+                return [(self._section_keys[key], score) for key, score in hits if key in self._section_keys]
+            except Exception:
+                logger.warning("Semantic search failed for uploaded documents; using keyword search.", exc_info=True)
+        return self.index.search(query, k=40)
 
     def search(self, query: str, max_results: int = 5, date_from: date | None = None,
                date_to: date | None = None) -> list[SearchResult]:
         best: dict[str, tuple[float, list]] = {}
-        for (doc, location, text), score in self.index.search(query, k=40):
+        for (doc, location, text), score in self._ranked_sections(query):
             entry = best.setdefault(doc["id"], (score, []))
             entry[1].append((location, text))
         results = []
@@ -76,6 +91,8 @@ class UploadedDocumentProvider:
                 title=doc["title"], provider="upload", doc_ref=doc["id"], snippet=doc["sections"][0][1][:400],
                 content="\n\n".join(t for _, t in doc["sections"]), full_text_available=True,
                 publisher=f"Uploaded file: {doc['filename']}", source_type="dataset" if doc["kind"] == "csv" else "user_document",
-                score=score, sections=list(doc["sections"]), metadata={"filename": doc["filename"], "kind": doc["kind"]},
+                score=score, sections=list(doc["sections"]), metadata={"filename": doc["filename"], "kind": doc["kind"],
+                    "table_columns": doc.get("metadata", {}).get("columns", []),
+                    "table_records": doc.get("metadata", {}).get("records", [])},
                 limitations=["User-provided document: provenance and accuracy not independently checked."]))
         return results

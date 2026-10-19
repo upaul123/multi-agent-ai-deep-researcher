@@ -18,6 +18,7 @@ from src.evidence.store import EvidenceStore
 from src.models.evidence import (Agreement, EpistemicLabel, InsightKind, ORIGIN_LABELS, Report, ReportSection)
 from src.models.research import ResearchMode
 from src.orchestration.state import ResearchState
+from src.services.llm import wrap_untrusted
 
 AGREEMENT_LABEL = {Agreement.STRONG: "strong agreement", Agreement.MODERATE: "moderate agreement",
                    Agreement.SINGLE_SOURCE: "single source", Agreement.MIXED: "mixed evidence",
@@ -48,6 +49,16 @@ class ProseDraft(BaseModel):
 
 def _numbers(text: str) -> set[str]:
     return {n.replace(",", "") for n in re.findall(r"\d[\d,]*(?:\.\d+)?", re.sub(r"\[\d+\]", "", text))}
+
+
+def _cell(text: str) -> str:
+    """Text that is safe inside a markdown table cell (or on one line)."""
+    return " ".join(str(text).replace("|", "/").split())
+
+
+def _strength(backed: int, total: int) -> str:
+    share = backed / total if total else 0
+    return "strong" if share >= 0.5 else "moderate" if share >= 0.25 else "limited"
 
 
 class ReportBuilderAgent(Agent):
@@ -81,37 +92,52 @@ class ReportBuilderAgent(Agent):
         def add(key: str, title: str, content: str) -> None:
             sections.append(ReportSection(key=key, title=title, content=content.strip() or "_No content._"))
 
-        # 1-2. Scope & methodology
+        # Introduction: objective, why it matters, scope and approach
         origins = {}
         for s in store.sources.values():
             origins[ORIGIN_LABELS[s.origin]] = origins.get(ORIGIN_LABELS[s.origin], 0) + 1
-        mode_note = ("**Demo mode:** all sources are SYNTHETIC and fictional; findings illustrate the workflow and are "
+        mode_note = ("> **Demo mode:** all sources are SYNTHETIC and fictional; findings illustrate the workflow and are "
                      "not real evidence." if demo else
-                     "**Live research:** sources were retrieved from the configured providers during this run "
+                     "> **Live research:** sources were retrieved from the configured providers during this run "
                      "(cached results are labelled).")
-        add("scope", "Research scope and methodology", "\n".join([
+        why = (f"It was requested with this background: {_cell(truncate(request.context, 300))}" if request.context else
+               "It gives decision makers a cited, balanced view of what the evidence shows, where sources disagree and "
+               "what remains uncertain.")
+        glance = [("Timeframe", plan.scope.timeframe)]
+        if plan.scope.geography:
+            glance.append(("Geography", plan.scope.geography))
+        glance += [("Research rounds", str(state.get("iteration", 0) + 1)),
+                   ("Searches run", str(usage.searches if usage else 0)),
+                   ("Sources reviewed", f"{len(store.sources)}" + (
+                       f" ({', '.join(f'{v} {k.lower()}' for k, v in origins.items())})" if origins else "")),
+                   ("Claims extracted", str(len(claims))),
+                   ("Stopping rule", state.get("stop_reason") or state.get("route_reason") or "n/a")]
+        introduction = "\n".join([
             mode_note, "",
-            f"- **Question:** {request.question}",
-            f"- **Timeframe:** {plan.scope.timeframe}" + (f" · **Geography:** {plan.scope.geography}" if plan.scope.geography else ""),
-            f"- **Objectives:** " + "; ".join(plan.objectives),
-            f"- **Strategy:** {plan.search_strategy}", "",
-            "**Subquestions investigated:**",
-            *[f"- {sq.id} ({sq.perspective}, priority {sq.priority}, {sq.status.value}): {sq.text}" for sq in plan.subquestions],
-            "",
-            f"**Process:** {state.get('iteration', 0) + 1} research round(s), "
-            f"{usage.searches if usage else 0} searches, {len(store.sources)} sources "
-            f"({', '.join(f'{v} {k.lower()}' for k, v in origins.items()) or 'none'}), {len(claims)} claims extracted. "
-            f"Stopping rule: {state.get('stop_reason') or state.get('route_reason', 'n/a')}", "",
-            "_Source assessments are rule-based indicators (type, date, wording, duplication), not calibrated probabilities._",
-        ]))
+            f"**Objective.** This report answers the question: _{_cell(request.question)}_ {why}", "",
+            "**Goals of the investigation**", "", *[f"- {o}" for o in plan.objectives], "",
+            "**Scope and approach**", "", "| Item | Detail |", "|---|---|",
+            *[f"| {k} | {_cell(v)} |" for k, v in glance], "",
+            f"**Search strategy.** {plan.search_strategy}", "",
+            "**Subquestions investigated**", "",
+            "| # | Subquestion | Perspective | Priority | Status |", "|---|---|---|---|---|",
+            *[f"| {n} | {_cell(sq.text)} | {_cell(sq.perspective)} | {sq.priority} | {sq.status.value} |"
+              for n, sq in enumerate(plan.subquestions, start=1)], "",
+            "_Source assessments are rule-based indicators (type, date, wording, duplication), not calibrated "
+            "probabilities._",
+        ])
 
-        # 3. Executive summary (deterministic draft)
+        # Executive summary (deterministic draft)
         findings = [i for i in insights if i.kind == InsightKind.FINDING]
         disagreements = [i for i in insights if i.kind == InsightKind.DISAGREEMENT]
         hypotheses = [i for i in insights if i.label == EpistemicLabel.SPECULATIVE]
         answered = sum(sq.status.value == "answered" for sq in plan.subquestions)
-        summary = [f"This investigation examined {len(plan.subquestions)} subquestions using {len(store.sources)} sources; "
-                   f"{answered} subquestion(s) met the evidence threshold."]
+        backed = sum(r.agreement in (Agreement.STRONG, Agreement.MODERATE) for r in rows)
+        strength = _strength(backed, len(rows))
+        summary = [f"**Objective:** {_cell(request.question)}", "",
+                   f"**Bottom line:** independent corroboration is **{strength}** ({backed} of {len(rows)} evidence "
+                   f"clusters are backed by two or more independent sources). {answered} of {len(plan.subquestions)} "
+                   f"subquestions met the evidence threshold, drawing on {len(store.sources)} sources.", ""]
         for f in findings[:3]:
             summary.append(f"- **Finding ({f.confidence} confidence):** {truncate(f.statement, 260)} {cite(f.source_ids)}")
         for d in disagreements[:2]:
@@ -120,21 +146,15 @@ class ReportBuilderAgent(Agent):
             summary.append(f"- **Hypothesis (speculative):** {truncate(hypotheses[0].statement.removeprefix('Hypothesis: '), 220)} "
                            f"{cite(hypotheses[0].source_ids)}")
         if not findings and not disagreements:
-            summary.append("- The evidence gathered was too thin to support firm findings; see the gaps below.")
+            summary.append("- The evidence gathered was too thin to support firm findings; see the recommendations "
+                           "and limitations below.")
         exec_summary = "\n".join(summary)
 
-        # 4. Key findings
-        key = []
-        for f in findings:
-            key.append(f"- {f.statement} {cite(f.source_ids)}  \n  _Observed · confidence {f.confidence}: "
-                       f"{f.confidence_explanation}_")
-        key_findings = "\n".join(key) or "No claim reached moderate or strong agreement across independent sources."
-
-        # 5. Detailed analysis by subquestion
+        # Analysis by subquestion
         detail = []
         for sq in plan.subquestions:
             sq_rows = sorted([r for r in rows if r.subquestion_id == sq.id], key=lambda r: -r.independent_sources)
-            detail.append(f"### {sq.text}\n_Status: {sq.status.value}_\n")
+            detail.append(f"### {sq.text}\n_Status: {sq.status.value} · {len(sq_rows)} evidence cluster(s)_\n")
             if not sq_rows:
                 detail.append("No relevant evidence was found for this subquestion.\n")
                 continue
@@ -151,14 +171,16 @@ class ReportBuilderAgent(Agent):
             detail.append("")
         detailed = "\n".join(detail)
 
-        # 6. Supporting and contradicting evidence (matrix)
+        # Evidence overview (matrix)
         table = ["| Claim | Supporting | Contradicting | Agreement | Quality |", "|---|---|---|---|---|"]
         for row in sorted(rows, key=lambda r: (r.agreement != Agreement.CONTESTED, -r.independent_sources))[:15]:
-            table.append(f"| {truncate(row.claim, 110).replace('|', '/')} | {cite(row.supporting_source_ids) or '–'} | "
+            table.append(f"| {_cell(truncate(row.claim, 110))} | {cite(row.supporting_source_ids) or '–'} | "
                          f"{cite(row.contradicting_source_ids) or '–'} | {AGREEMENT_LABEL[row.agreement]} | "
                          f"{row.evidence_quality.value} |")
+        if not rows:
+            table = ["No claims were extracted, so there is no evidence to compare."]
         if contradictions:
-            table.append("\n**Contradictions identified:**")
+            table.append("\n**Contradictions identified:**\n")
             for con in contradictions[:8]:
                 a, b = claims.get(con.claim_a_id), claims.get(con.claim_b_id)
                 if a and b:
@@ -166,27 +188,76 @@ class ReportBuilderAgent(Agent):
                                  f"\"{truncate(b.text, 140)}\" {cite([b.source_id])}: {con.explanation}")
         evidence_section = "\n".join(table)
 
-        # 7-9. Trends & hypotheses; implications; risks & alternatives
-        def insight_lines(kinds: set, prefix: str = "") -> str:
+        # Findings: key findings table, then trends, implications and risks
+        def insight_lines(kinds: set) -> str:
             lines = []
             for i in insights:
                 if i.kind in kinds:
                     tag = {"observed": "Observed", "inferred": "Inferred", "speculative": "Speculative"}[i.label.value]
-                    lines.append(f"- **{tag}{prefix}:** {i.statement} {cite(i.source_ids)}  \n  _Confidence {i.confidence}: "
+                    lines.append(f"- **{tag}:** {i.statement} {cite(i.source_ids)}  \n  _Confidence {i.confidence}: "
                                  f"{i.confidence_explanation}_" + (f"  \n  _Alternatives: {'; '.join(i.alternatives[:2])}_"
                                                                    if i.alternatives else ""))
             return "\n".join(lines)
-        trends = insight_lines({InsightKind.TREND, InsightKind.HYPOTHESIS}) or "No recurring trends or hypotheses emerged."
-        implications = insight_lines({InsightKind.IMPLICATION, InsightKind.OPPORTUNITY}) or "No implications were derived."
-        risks = insight_lines({InsightKind.RISK, InsightKind.DISAGREEMENT}) or "No specific risks were identified."
+        if findings:
+            key = ["| # | Finding | Confidence | Basis |", "|---|---|---|---|",
+                   *[f"| {n} | {_cell(f.statement)} {cite(f.source_ids)} | {f.confidence} | "
+                     f"{_cell(f.confidence_explanation)} |" for n, f in enumerate(findings, start=1)]]
+        else:
+            key = ["No claim reached moderate or strong agreement across independent sources."]
+        key += ["", "### Emerging trends and hypotheses",
+                insight_lines({InsightKind.TREND, InsightKind.HYPOTHESIS}) or "None identified.",
+                "", "### Implications and opportunities",
+                insight_lines({InsightKind.IMPLICATION, InsightKind.OPPORTUNITY}) or "None identified.",
+                "", "### Risks and alternative interpretations",
+                insight_lines({InsightKind.RISK, InsightKind.DISAGREEMENT}) or "None identified."]
+        key_findings = "\n".join(key)
 
-        # 10. Next steps
-        steps = [f"- {g.description} Suggested searches: " + ", ".join(f"“{q}”" for q in g.follow_up_queries[:2])
-                 for g in sorted(gaps, key=lambda g: -g.expected_value)[:5] if g.follow_up_queries]
-        steps += [f"- {i.next_investigation}" for i in insights if i.next_investigation][:4]
-        next_steps = "\n".join(dict.fromkeys(steps)) or "- No further research is recommended at this depth."
+        # Recommendations: actionable next steps, each tied to the evidence behind it
+        recs = []
+        for f in [f for f in findings if f.confidence in ("high", "medium")][:2]:
+            recs.append(f"**Build on well-supported evidence.** {truncate(f.statement, 220)} {cite(f.source_ids)}")
+        for i in [i for i in insights if i.kind in (InsightKind.OPPORTUNITY, InsightKind.IMPLICATION)][:2]:
+            recs.append(f"**Assess this opportunity.** {truncate(i.statement, 220)} {cite(i.source_ids)}")
+        for i in [i for i in insights if i.kind == InsightKind.RISK][:2]:
+            recs.append(f"**Plan for this risk.** {truncate(i.statement, 220)} {cite(i.source_ids)}")
+        for row in [r for r in rows if r.agreement in (Agreement.CONTESTED, Agreement.MIXED)][:1]:
+            recs.append(f"**Resolve the disagreement before relying on it.** {truncate(row.claim, 200)} "
+                        f"{cite(row.supporting_source_ids + row.contradicting_source_ids)}")
+        for g in sorted(gaps, key=lambda g: -g.expected_value)[:2]:
+            if g.follow_up_queries:
+                recs.append(f"**Close an evidence gap.** {g.description} Suggested searches: "
+                            + ", ".join(f"“{q}”" for q in g.follow_up_queries[:2]))
+        if rows and strength == "limited":
+            recs.append("**Seek independent corroboration.** Most claims rest on a single source; look for independent "
+                        "studies or primary data before acting on them.")
+        recs += [f"**Investigate further.** {i.next_investigation}" for i in insights if i.next_investigation][:2]
+        recs = list(dict.fromkeys(recs))[:8]
+        next_steps = ("\n".join(f"{n}. {r}" for n, r in enumerate(recs, start=1))
+                      or "No specific actions are recommended at this depth; the evidence was too limited.")
 
-        # 11. Limitations
+        # Conclusion
+        if rows:
+            conclusion = [f"Independent corroboration of the evidence gathered is **{strength}**: {answered} of "
+                          f"{len(plan.subquestions)} subquestions met the evidence threshold, and {backed} of {len(rows)} "
+                          "evidence clusters are corroborated by two or more independent sources."]
+            if findings:
+                conclusion.append(f"The best-supported finding is: {truncate(findings[0].statement, 240)} "
+                                  f"{cite(findings[0].source_ids)}")
+            if disagreements:
+                conclusion.append(f"The main open disagreement is: {truncate(disagreements[0].statement, 400)} "
+                                  f"{cite(disagreements[0].source_ids)}")
+            conclusion.append("Treat these conclusions as a cited starting point and verify important points against "
+                              "the original sources before acting on them.")
+        else:
+            conclusion = ["The research did not find enough relevant evidence to answer the question, so no "
+                          "conclusion is drawn. The question may be too narrow or use unusual terms, or the configured "
+                          "sources may not cover it. Rephrase the question or broaden its scope."]
+        if demo:
+            conclusion.append("Because every source is synthetic demo data, these conclusions illustrate the workflow "
+                              "only.")
+        conclusion_text = "\n\n".join(conclusion)
+
+        # Limitations
         abstract_only = sum(not s.full_text_available for s in store.sources.values())
         flagged = {f for a in assessments.values() for f in a.flags}
         limits = [
@@ -208,9 +279,9 @@ class ReportBuilderAgent(Agent):
             limits.append(f"- Research stopped partly because limits were reached: {', '.join(state['usage'].exhausted)}.")
         unresolved = sorted({q for r in rows for q in r.unresolved_questions})
         if unresolved:
-            limits.append("\n**Unresolved questions:**\n" + "\n".join(f"- {q}" for q in unresolved[:6]))
+            limits.append("\n**Unresolved questions:**\n\n" +"\n".join(f"- {q}" for q in unresolved[:6]))
         if state.get("errors"):
-            limits.append("\n**Errors during the run:**\n" + "\n".join(f"- {e}" for e in state["errors"][:5]))
+            limits.append("\n**Errors during the run:**\n\n" +"\n".join(f"- {e}" for e in state["errors"][:5]))
         limitations = "\n".join(limits)
 
         # Optional LLM prose for summary + analysis, validated.
@@ -221,16 +292,33 @@ class ReportBuilderAgent(Agent):
                 exec_summary, detailed = prose
                 generated_by = "llm (citations validated)"
 
+        # Introduction → Analysis → Findings → Recommendations → Conclusion, with the summary first and the
+        # supporting material (limitations, chart data, sources) after.
         add("executive_summary", "Executive summary", exec_summary)
-        add("key_findings", "Key findings", key_findings)
-        add("detailed_analysis", "Detailed analysis", detailed)
-        add("evidence", "Supporting and contradicting evidence", evidence_section)
-        add("trends", "Emerging trends and hypotheses", trends)
-        add("implications", "Implications and opportunities", implications)
-        add("risks", "Risks and alternative interpretations", risks)
-        add("next_steps", "Recommendations and next steps", next_steps)
+        add("introduction", "Introduction", introduction)
+        add("detailed_analysis", "Analysis", detailed)
+        add("evidence", "Evidence overview", evidence_section)
+        add("key_findings", "Findings", key_findings)
+        add("next_steps", "Recommendations", next_steps)
+        add("conclusion", "Conclusion", conclusion_text)
         add("limitations", "Limitations and unresolved questions", limitations)
 
+        # One table per kind of chart; the same figure reported by several charts is listed once.
+        chart_lines, grouped = [], {}
+        for chart in state.get("charts", []):
+            grouped.setdefault((chart.title, chart.unit, chart.limitation, chart.synthetic), []).extend(chart.points)
+        for (title, unit, limitation, synthetic), points in grouped.items():
+            chart_lines += [f"### {title}" + (" (synthetic)" if synthetic else ""), f"_Unit: {unit}. {limitation}_", "",
+                            "| Figure | Value | Source location |", "|---|---|---|"]
+            seen = set()
+            for point in points:
+                if (point.label, point.value) not in seen:
+                    seen.add((point.label, point.value))
+                    chart_lines.append(f"| {_cell(point.label)} | **{point.value:g} {_cell(unit)}** "
+                                       f"{cite([point.source_id])} | {_cell(point.location)} |")
+            chart_lines.append("")
+        add("visualizations", "Data behind the charts", "\n".join(chart_lines)
+            or "No unambiguous numeric dataset was available; no chart values were invented.")
         references = build_references([store.sources[sid] for sid in cite.order])
         add("references", "References", "\n".join(format_reference(r) for r in references) or "_No sources cited._")
 
@@ -242,15 +330,23 @@ class ReportBuilderAgent(Agent):
     def _llm_prose(self, question: str, summary: str, detailed: str, store: EvidenceStore, cite: Citer,
                    ctx: RunContext) -> tuple[str, str] | None:
         valid = set(range(1, len(cite.order) + 1))
-        prompt = (f"Research question: {question}\nRewrite the two draft sections below into clear, balanced prose for a "
-                  "decision maker. Keep every citation marker like [3] next to the statement it supports; do not add "
-                  "new markers, facts or numbers. Keep disagreements and uncertainty explicit, and keep speculative "
+        prompt = ("Research question:\n" + wrap_untrusted("research_question", question)
+                  + "\nRewrite the two draft sections below into clear, balanced prose for a "
+                  "decision maker. Use short, precise sentences, a neutral and professional tone, and plain language "
+                  "(explain any necessary jargon). Keep the opening objective and bottom-line lines of the executive "
+                  "summary first, then use bullet points for the key points. Keep every citation marker like [3] next "
+                  "to the statement it supports; do not add new markers, facts or numbers. Keep disagreements and uncertainty explicit, and keep speculative "
                   "statements labelled as hypotheses. Return {\"executive_summary\": ..., \"detailed_analysis\": ...} "
                   "(markdown allowed; keep the ### subquestion headings in the analysis).\n\n"
-                  f"DRAFT EXECUTIVE SUMMARY:\n{summary}\n\nDRAFT DETAILED ANALYSIS:\n{detailed[:9000]}")
+                  "DRAFT EXECUTIVE SUMMARY:\n" + wrap_untrusted("draft_summary", summary)
+                  + "\n\nDRAFT DETAILED ANALYSIS:\n" + wrap_untrusted("draft_analysis", detailed[:9000]))
         draft = ctx.llm.structured(prompt, ProseDraft, ctx.budget, max_tokens=3000)
         if not draft:
             return None
+        for original, rewritten in ((summary, draft.executive_summary), (detailed[:9000], draft.detailed_analysis)):
+            if set(re.findall(r"\[\d+\]", original)) != set(re.findall(r"\[\d+\]", rewritten)):
+                ctx.event(self.name, "info", "LLM rewrite rejected: citation markers were changed or removed.")
+                return None
         allowed_numbers = _numbers(summary + detailed + " ".join(s.content for s in store.sources.values()))
         new_numbers = {n for n in _numbers(draft.executive_summary + draft.detailed_analysis)
                        if n not in allowed_numbers and not (n.isdigit() and int(n) < 13)}

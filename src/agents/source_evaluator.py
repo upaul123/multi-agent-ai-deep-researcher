@@ -5,6 +5,7 @@ They are NOT calibrated probabilities of truth, and a reputable publisher does n
 """
 from __future__ import annotations
 
+import logging
 import re
 
 from src.agents.base import Agent, RunContext
@@ -14,6 +15,7 @@ from src.models.evidence import EvidenceQuality, Freshness, Source, SourceAssess
 from src.orchestration.state import ResearchState
 from src.retrieval.bm25 import BM25Index
 
+logger = logging.getLogger(__name__)
 BASE_QUALITY = {
     SourceType.ACADEMIC_PAPER: EvidenceQuality.HIGH, SourceType.OFFICIAL: EvidenceQuality.HIGH,
     SourceType.PREPRINT: EvidenceQuality.MEDIUM, SourceType.ANALYST: EvidenceQuality.MEDIUM,
@@ -129,6 +131,25 @@ def repeats(source: Source, other: Source, order: dict[str, int]) -> bool:
     return order.get(other.id, 1e9) < order.get(source.id, 1e9)
 
 
+def _passage_scores(query: str, passages: list, vectors) -> dict[str, float]:
+    """Best passage score per source: Pinecone similarity when vectors are on, BM25 otherwise (or on failure)."""
+    ranked = None
+    if vectors is not None and passages:
+        try:
+            vectors.ensure_indexed((p.id, p.text, {"kind": "passage", "source_id": p.source_id}) for p in passages)
+            by_id = {p.id: p for p in passages}
+            ranked = [(by_id[pid], score) for pid, score in vectors.search(query, k=len(passages), kind="passage")
+                      if pid in by_id]
+        except Exception:
+            logger.warning("Semantic search failed for source relevance; using keyword search.", exc_info=True)
+    if ranked is None:
+        ranked = BM25Index(passages, lambda p: p.text).search(query, k=len(passages) or 1)
+    scores: dict[str, float] = {}
+    for passage, score in ranked:
+        scores[passage.source_id] = max(scores.get(passage.source_id, 0.0), score)
+    return scores
+
+
 class SourceEvaluatorAgent(Agent):
     name = "source_evaluator"
     title = "Source Evaluation"
@@ -139,10 +160,7 @@ class SourceEvaluatorAgent(Agent):
         store = EvidenceStore(sources, state.get("passages", []))
         plan = state["plan"]
         query = " ".join([plan.question] + [s.text for s in plan.subquestions])
-        index = BM25Index(store.all_passages(), lambda p: p.text)
-        scores: dict[str, float] = {}
-        for passage, score in index.search(query, k=len(store.all_passages()) or 1):
-            scores[passage.source_id] = max(scores.get(passage.source_id, 0.0), score)
+        scores = _passage_scores(query, store.all_passages(), ctx.providers.vectors)
         top = max(scores.values(), default=1.0) or 1.0
 
         assessments = dict(state.get("assessments", {}))

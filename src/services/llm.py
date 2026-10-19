@@ -11,6 +11,7 @@ Guardrails:
 from __future__ import annotations
 
 import json
+from html import escape
 import logging
 import re
 import time
@@ -19,6 +20,7 @@ from typing import TypeVar
 from pydantic import BaseModel, ValidationError
 
 from src.config import Settings
+from src.services.observability import span
 from src.orchestration.budget import RunBudget
 
 logger = logging.getLogger(__name__)
@@ -36,8 +38,8 @@ SYSTEM_POLICY = (
 
 
 def wrap_untrusted(source_id: str, text: str) -> str:
-    safe = re.sub(r"</?\s*untrusted_source[^>]*>", "", text)
-    return f'<untrusted_source id="{source_id}">\n{safe}\n</untrusted_source>'
+    safe = re.sub(r"</?\s*untrusted_source[^>]*>", "", text, flags=re.I)
+    return f'<untrusted_source id="{escape(source_id, quote=True)}">\n{safe}\n</untrusted_source>'
 
 
 class LLMUnavailable(RuntimeError):
@@ -47,6 +49,9 @@ class LLMUnavailable(RuntimeError):
 class LLMClient:
     def __init__(self, settings: Settings, client=None, sleep=time.sleep):
         self.model = settings.openrouter_model
+        self.timeout = settings.llm_timeout
+        self.input_price = settings.input_usd_per_million
+        self.output_price = settings.output_usd_per_million
         self.sleep = sleep
         self._client = client
         if client is None and settings.openrouter_api_key:
@@ -68,22 +73,42 @@ class LLMClient:
             raise LLMUnavailable("LLM budget exhausted for this run.")
         kwargs = {"response_format": {"type": "json_object"}} if json_mode else {}
         last: Exception | None = None
+        # UTF-8 bytes form a conservative bound for byte-tokenized text, plus message framing.
+        reservation = len((system + prompt).encode("utf-8")) + max_tokens + 256
         for attempt in range(1, attempts + 1):
+            if not budget.reserve_llm_attempt(reservation):
+                raise LLMUnavailable("LLM attempt, token or time budget exhausted for this run.")
+            remaining = budget.time_left()
+            if remaining <= 0:
+                budget.finish_llm_attempt(reservation)
+                raise LLMUnavailable("LLM time budget exhausted for this run.")
             try:
-                response = self._client.chat.completions.create(
-                    model=self.model, temperature=temperature, max_tokens=max_tokens,
-                    messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}], **kwargs)
+                with span("openrouter.request", run_type="llm", metadata={
+                        "ls_provider": "openrouter", "ls_model_name": self.model, "attempt": attempt}) as telemetry:
+                    response = self._client.chat.completions.create(
+                        model=self.model, temperature=temperature, max_tokens=max_tokens, timeout=min(self.timeout, remaining),
+                        messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}], **kwargs)
+                    usage = getattr(response, "usage", None)
+                    if usage:
+                        telemetry["usage_metadata"] = {name: getattr(usage, attr, None) for name, attr in (
+                            ("input_tokens", "prompt_tokens"), ("output_tokens", "completion_tokens"),
+                            ("total_tokens", "total_tokens"))}
+                content = (response.choices[0].message.content or "").strip()
                 usage = getattr(response, "usage", None)
-                budget.record_tokens(getattr(usage, "total_tokens", 0) if usage else len(prompt) // 4)
-                return (response.choices[0].message.content or "").strip()
+                budget.finish_llm_attempt(reservation, usage, self.input_price, self.output_price)
+                return content
             except Exception as exc:  # classify without depending on SDK internals
+                budget.finish_llm_attempt(reservation)
                 last = exc
                 status = getattr(exc, "status_code", None)
                 transient = status in (408, 409, 429, 500, 502, 503, 504) or type(exc).__name__ in (
                     "APITimeoutError", "APIConnectionError", "RateLimitError", "InternalServerError")
                 if not transient or attempt == attempts:
                     break
-                self.sleep(min(2 ** attempt, 20))
+                delay = min(2 ** attempt, 20, max(0.0, budget.time_left()))
+                if delay <= 0:
+                    break
+                self.sleep(delay)
         logger.warning("LLM call failed: %s", type(last).__name__)
         raise LLMUnavailable(f"LLM call failed ({type(last).__name__}).") from last
 

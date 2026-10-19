@@ -3,7 +3,7 @@ import pytest
 
 from src.agents.gap_analyst import decide_route
 from src.models.evidence import GapKind, ResearchGap
-from src.models.research import Depth, ResearchBudget, ResearchMode, ResearchRequest
+from src.models.research import Depth, ResearchBudget, ResearchRequest
 from src.orchestration.budget import RunBudget
 from src.orchestration.graph import AGENTS, build_graph, route_after_gaps
 from src.services.llm import LLMClient, LLMUnavailable
@@ -148,6 +148,8 @@ def test_llm_retries_transient_errors(settings):
     budget = RunBudget(ResearchBudget())
     assert llm.complete("hi", budget) == '{"ok": true}' and len(sleeps) == 2
     assert budget.usage.llm_calls == 1 and budget.usage.llm_tokens == 123
+    assert budget.usage.llm_attempts == 3 and budget.usage.llm_unreported_tokens > 0
+    assert budget.usage.llm_reserved_tokens == 0
 
 
 def test_llm_non_transient_error_and_budget(settings):
@@ -166,3 +168,32 @@ def test_missing_llm_key_is_graceful(settings):
     llm = LLMClient(settings)
     assert not llm.available
     assert llm.structured("x", ResearchBudget, RunBudget(ResearchBudget())) is None
+
+
+def test_synthesis_branches_fan_out_and_join(settings):
+    from src.agents.base import RunContext
+    from src.search.registry import ProviderSet
+    graph = build_graph(RunContext(settings=settings, budget=RunBudget(ResearchBudget()), providers=ProviderSet()))
+    edges = {(e.source, e.target) for e in graph.get_graph().edges}
+    assert {("gap_analyst", "insight_generator"), ("gap_analyst", "data_visualizer"),
+            ("insight_generator", "report_builder"), ("data_visualizer", "report_builder")} <= edges
+    assert ("insight_generator", "data_visualizer") not in edges  # no longer sequential
+
+
+def test_insights_and_charts_run_in_parallel(settings, demo_request, monkeypatch):
+    """Both synthesis agents must be inside their run() at the same time: a 2-party barrier only opens then."""
+    import threading
+    barrier = threading.Barrier(2, timeout=10)
+    for name in ("insight_generator", "data_visualizer"):
+        agent = AGENTS[name]
+        original = agent.run
+
+        def run(state, ctx, original=original):
+            barrier.wait()  # raises BrokenBarrierError (an agent failure) if the other branch is not running
+            return original(state, ctx)
+        monkeypatch.setattr(agent, "run", run)
+    state = run_research(demo_request, settings, today=TODAY)
+    assert state["errors"] == [] and state["report"] is not None
+    assert state["statuses"]["insight_generator"].status == "completed"
+    assert state["statuses"]["data_visualizer"].status == "completed"
+    assert all(s.status == "completed" for s in state["statuses"].values())  # merged, nothing lost

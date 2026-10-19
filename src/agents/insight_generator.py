@@ -19,6 +19,7 @@ from src.evidence.store import EvidenceStore
 from src.models.evidence import (Agreement, Claim, ClaimType, EpistemicLabel, EvidenceQuality, Insight, InsightKind,
                                  MatrixRow)
 from src.orchestration.state import ResearchState
+from src.services.llm import wrap_untrusted
 
 RISK_CUES = re.compile(r"\b(risks?|concerns?|barriers?|liabilit\w*|exposure|errors?|churn|dependence|constraints?|"
                        r"compliance|regulatory|squeez\w*|compress\w*|lower gross margins?)\b", re.I)
@@ -224,8 +225,9 @@ class InsightGeneratorAgent(Agent):
             lines.append(f"- row {row.id} [{row.agreement.value}, quality {row.evidence_quality.value}, "
                          f"{row.independent_sources} independent]: {truncate(row.claim, 240)} | supporting claims: "
                          f"{', '.join(row.supporting_claim_ids[:4])} | contradicting: {', '.join(row.contradicting_claim_ids[:3]) or 'none'}")
-        prompt = (f"Research question: {state['plan'].question}\nEvidence matrix (claim ids in brackets are the only "
-                  "valid evidence references):\n" + "\n".join(lines) +
+        prompt = ("Research question:\n" + wrap_untrusted("research_question", state['plan'].question)
+                  + "\nEvidence matrix (claim ids in brackets are the only "
+                  "valid evidence references):\n" + wrap_untrusted("evidence_matrix", "\n".join(lines)) +
                   "\n\nGenerate 6-10 insights. kind is one of finding, trend, hypothesis, implication, risk, opportunity, "
                   "disagreement. label is observed (stated directly by sources), inferred (reasoned from several) or "
                   "speculative (hypothesis). Hypotheses MUST be labelled speculative. Each insight must cite "
@@ -237,7 +239,7 @@ class InsightGeneratorAgent(Agent):
         insights = []
         for draft in drafts.insights:
             ids = [i for i in draft.evidence_claim_ids if i in claims]
-            if not ids:
+            if not ids or len(ids) != len(draft.evidence_claim_ids):
                 continue  # never accept an insight without real evidence
             try:
                 kind = InsightKind(draft.kind.lower())

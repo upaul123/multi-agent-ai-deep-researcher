@@ -2,7 +2,9 @@
 detects contradictions, methodological weaknesses and overstated conclusions."""
 from __future__ import annotations
 
+from src.services.observability import map_with_context
 from concurrent.futures import ThreadPoolExecutor
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -19,7 +21,7 @@ MAX_LLM_SOURCES_PER_ITERATION = 12
 
 class Verdict(BaseModel):
     index: int
-    verdict: str
+    verdict: Literal["contradicts", "compatible", "unrelated"]
     explanation: str = ""
 
 
@@ -49,12 +51,12 @@ class CriticalAnalystAgent(Agent):
         llm_results: dict[str, list[Claim]] = {}
         if llm_targets:
             with ThreadPoolExecutor(max_workers=ctx.max_parallel) as pool:
-                for source_id, extracted, rejected in pool.map(
+                for source_id, extracted, rejected in map_with_context(pool,
                         lambda s: self._llm_extract(s, store, plan, matcher, ctx), llm_targets):
                     if extracted is not None:
                         llm_results[source_id] = extracted
                     if rejected:
-                        notes.append(f"Rejected {rejected} LLM-proposed claim(s) whose quotes were not found verbatim.")
+                        notes.append(f"Rejected {rejected} LLM-proposed claim(s) that failed quotation or paraphrase integrity checks.")
         for source in todo:
             extracted = llm_results.get(source.id)
             if extracted is None:
@@ -81,8 +83,10 @@ class CriticalAnalystAgent(Agent):
     def _adjudicate(self, contradictions, claims, ctx: RunContext):
         """Ask the LLM whether each heuristic candidate is a real contradiction (validated verdicts only)."""
         items = [c for c in contradictions if c.claim_a_id in claims and c.claim_b_id in claims][:15]
-        listing = "\n".join(f'{i}. A: "{claims[c.claim_a_id].quote}" || B: "{claims[c.claim_b_id].quote}"'
-                            for i, c in enumerate(items))
+        listing = "\n".join(
+            f"Pair {i}:\nA: " + wrap_untrusted(claims[c.claim_a_id].source_id, claims[c.claim_a_id].quote)
+            + "\nB: " + wrap_untrusted(claims[c.claim_b_id].source_id, claims[c.claim_b_id].quote)
+            for i, c in enumerate(items))
         prompt = ("For each numbered pair of quoted statements from different sources, decide whether they genuinely "
                   "contradict each other (incompatible claims about the same thing), are compatible, or are about "
                   "different things. Return {\"verdicts\": [{\"index\": 0, \"verdict\": \"contradicts|compatible|"
@@ -107,8 +111,8 @@ class CriticalAnalystAgent(Agent):
         if not passages:
             return source.id, None, 0
         text = "\n\n".join(f"[{p.location}] {p.text}" for p in passages)
-        prompt = (f"Research question: {plan.question}\nSubquestions: "
-                  + "; ".join(f"{s.id}: {s.text}" for s in plan.subquestions)
+        prompt = ("Research request:\n" + wrap_untrusted("research_plan", plan.question + "\nSubquestions: "
+                  + "; ".join(f"{s.id}: {s.text}" for s in plan.subquestions))
                   + "\n\nExtract up to 6 specific, checkable claims relevant to the research question from the source "
                     "below. For each, copy the supporting sentence EXACTLY into 'quote'. Classify claim_type and set "
                     "sceptical=true if the claim doubts or limits a premise. Return {\"claims\": [...]}.\n\n"

@@ -1,9 +1,32 @@
--- Deep Researcher AI persistence. Every per-run table references runs(id) ON DELETE CASCADE,
--- so deleting a run removes all of its stored evidence. No secrets are stored.
+-- Deep Researcher AI persistence. Every per-run table references runs(id) ON DELETE CASCADE, and the repository also
+-- deletes child rows explicitly (remote databases may not enforce cascades per connection). No secrets are stored.
+-- Ownership: runs and documents carry owner_id (the signed-in user's stable id, "local" without login, or a
+-- per-session guest id). Every repository read and write is filtered by owner.
+
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,               -- stable identity-provider subject, or "local"
+    email TEXT,
+    name TEXT,
+    picture TEXT,
+    provider TEXT NOT NULL DEFAULT 'local',
+    created_at TEXT NOT NULL,
+    last_login TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS activity (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_id TEXT NOT NULL,
+    kind TEXT NOT NULL,                -- login | run_started | run_completed | run_failed | run_cancelled | run_deleted | qa | export | upload | data_deleted
+    run_id TEXT,
+    detail TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_activity_owner ON activity(owner_id, created_at);
 -- Indexed columns hold identifiers/relationships; `data` holds the full validated Pydantic record as JSON.
 
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL DEFAULT 'local',
     question TEXT NOT NULL,
     status TEXT NOT NULL,              -- running | completed | failed
     mode TEXT NOT NULL,                -- demo | live
@@ -141,17 +164,19 @@ CREATE TABLE IF NOT EXISTS qa_messages (
     created_at TEXT NOT NULL
 );
 
--- Uploaded documents are global (reusable across runs) and can be deleted independently.
+-- Uploaded documents are owner-scoped (reusable across that owner's runs) and can be deleted independently.
 CREATE TABLE IF NOT EXISTS documents (
     id TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL DEFAULT 'local',
     filename TEXT NOT NULL,
     title TEXT NOT NULL,
     kind TEXT NOT NULL,
-    sha256 TEXT NOT NULL UNIQUE,
+    sha256 TEXT NOT NULL,
     size_bytes INTEGER NOT NULL,
     sections TEXT NOT NULL,
     warnings TEXT NOT NULL DEFAULT '[]',
-    uploaded_at TEXT NOT NULL
+    uploaded_at TEXT NOT NULL,
+    UNIQUE (owner_id, sha256)
 );
 
 CREATE TABLE IF NOT EXISTS search_cache (
@@ -165,4 +190,10 @@ CREATE TABLE IF NOT EXISTS search_cache (
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+-- Chart payloads contain values and passage provenance, scoped through run ownership.
+CREATE TABLE IF NOT EXISTS charts (
+ run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, id TEXT NOT NULL, data TEXT NOT NULL,
+ PRIMARY KEY (run_id, id)
 );

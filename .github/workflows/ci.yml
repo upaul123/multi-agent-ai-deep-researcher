@@ -1,0 +1,25 @@
+name: Quality checks
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  offline-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install tested dependencies and linter
+        run: python -m pip install -r requirements.txt -c constraints.txt ruff==0.17.0
+      - name: Check dependency consistency
+        run: python -m pip check
+      - name: Lint correctness
+        run: ruff check .
+      - name: Offline regression tests
+        run: pytest
+      - name: Scan source and reachable history for credential candidates
+        run: python scripts/scan_secrets.py
